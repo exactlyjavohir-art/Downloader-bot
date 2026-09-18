@@ -1,245 +1,476 @@
-import asyncio
-import logging
+"""
+Ko'p funksiyali Video Downloader — Telegram Bot
+=================================================
+
+Funksiyalar:
+- Instagram, TikTok, YouTube Shorts linklarini qabul qiladi
+- Video VA rasm/karusel postlarni yuklab beradi
+- Til tanlash (O'zbek / Rus)
+- Foydalanuvchi statistikasi (nechta video yuklagani)
+- Sifat tanlash (HD / Past sifat)
+- Yuklanish progress-bar bilan ko'rsatiladi
+- Guruhlarda ham ishlaydi (BotFather'da privacy mode o'chirilishi kerak)
+"""
+
 import os
-import sys
-import sqlite3
-from aiogram import Bot, Dispatcher, F, html
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
-from aiogram.filters import CommandStart, Command
-from aiogram.types import Message, FSInputFile, CallbackQuery
-from aiogram.utils.keyboard import InlineKeyboardBuilder
+import re
+import json
+import uuid
+import logging
+import asyncio
+import tempfile
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputMediaPhoto,
+    InputMediaVideo,
+)
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
+)
 import yt_dlp
 
-TOKEN = os.getenv("8858895999:AAFHOkyvINgssJqgtnuV7UKd_odCbC0R38o")
-# Majburiy obuna uchun kanal usernamesi (Masalan: "@kanal_username" yoki shart bo'lmasa None qoldiring)
-REQUIRED_CHANNEL = os.getenv("REQUIRED_CHANNEL", None) 
+# ------------------------------------------------------------------
+# SOZLAMALAR
+# ------------------------------------------------------------------
 
-# --- MA'LUMOTLAR BAZASINI BIR FAYLNING O'ZIDA YARATISH ---
-def init_db():
-    db = sqlite3.connect("bot_database.db")
-    cursor = db.cursor()
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
-        downloads_count INTEGER DEFAULT 0
-    )
-    """)
-    db.commit()
-    db.close()
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "SIZNING_TOKENINGIZ_BU_YERGA")
+DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data.json")
+MAX_FILE_SIZE_MB = 50
 
-def add_user(user_id: int):
-    db = sqlite3.connect("bot_database.db")
-    cursor = db.cursor()
-    cursor.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
-    db.commit()
-    db.close()
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
 
-def get_stats():
-    db = sqlite3.connect("bot_database.db")
-    cursor = db.cursor()
-    cursor.execute("SELECT COUNT(*) FROM users")
-    count = cursor.fetchone()[0]
-    db.close()
-    return count
+URL_PATTERN = re.compile(
+    r"(https?://(www\.)?(instagram\.com|tiktok\.com|vm\.tiktok\.com|"
+    r"youtube\.com/shorts|youtu\.be)/\S+)"
+)
 
-def increment_download(user_id: int):
-    db = sqlite3.connect("bot_database.db")
-    cursor = db.cursor()
-    cursor.execute("UPDATE users SET downloads_count = downloads_count + 1 WHERE user_id = ?", (user_id,))
-    db.commit()
-    db.close()
+# ------------------------------------------------------------------
+# MATNLAR (TIL)
+# ------------------------------------------------------------------
 
-dp = Dispatcher()
+TEXTS = {
+    "uz": {
+        "choose_lang": "Tilni tanlang / Выберите язык:",
+        "welcome": (
+            "Salom! Menga Instagram, TikTok yoki YouTube Shorts linkini "
+            "yuboring, men video yoki rasmlarni yuklab beraman."
+        ),
+        "not_a_link": "Iltimos, to'g'ri link yuboring (Instagram, TikTok yoki YouTube Shorts).",
+        "choose_quality": "Sifatni tanlang:",
+        "hd": "🎬 HD sifat",
+        "sd": "📉 Past sifat (tezroq)",
+        "mp3": "🎵 MP3 (audio)",
+        "downloading": "⏳ Yuklanmoqda...",
+        "sending": "📤 Yuborilmoqda...",
+        "done": "✅ Tayyor!",
+        "too_big": "❌ Fayl juda katta (50MB dan oshadi), Telegram orqali yuborib bo'lmaydi.",
+        "error": "❌ Yuklab bo'lmadi. Link yopiq (private) akkauntga tegishli bo'lishi yoki tuzilma o'zgargan bo'lishi mumkin.",
+        "unexpected_error": "❌ Kutilmagan xatolik yuz berdi. Birozdan so'ng qayta urinib ko'ring.",
+        "stats": "📊 Siz jami *{count}* ta media yuklab oldingiz.",
+        "lang_set": "✅ Til o'zbek tiliga o'rnatildi.",
+    },
+    "ru": {
+        "choose_lang": "Выберите язык / Tilni tanlang:",
+        "welcome": (
+            "Привет! Отправь мне ссылку из Instagram, TikTok или YouTube Shorts, "
+            "и я скачаю видео или фото."
+        ),
+        "not_a_link": "Пожалуйста, отправьте корректную ссылку (Instagram, TikTok или YouTube Shorts).",
+        "choose_quality": "Выберите качество:",
+        "hd": "🎬 HD качество",
+        "sd": "📉 Низкое качество (быстрее)",
+        "mp3": "🎵 MP3 (аудио)",
+        "downloading": "⏳ Загрузка...",
+        "sending": "📤 Отправка...",
+        "done": "✅ Готово!",
+        "too_big": "❌ Файл слишком большой (более 50MB), Telegram не позволяет отправить.",
+        "error": "❌ Не удалось скачать. Возможно, аккаунт закрытый или изменилась структура сайта.",
+        "unexpected_error": "❌ Произошла непредвиденная ошибка. Попробуйте снова чуть позже.",
+        "stats": "📊 Вы всего скачали *{count}* медиафайлов.",
+        "lang_set": "✅ Язык установлен на русский.",
+    },
+}
 
-# Majburiy obunani tekshirish funksiyasi
-async def check_subscription(bot: Bot, user_id: int) -> bool:
-    if not REQUIRED_CHANNEL:
-        return True
+
+def t(user_id: int, key: str) -> str:
+    lang = get_user(user_id).get("lang", "uz")
+    return TEXTS[lang][key]
+
+
+# ------------------------------------------------------------------
+# MA'LUMOTLARNI SAQLASH (til, statistika)
+# ------------------------------------------------------------------
+
+def load_data() -> dict:
+    if not os.path.exists(DATA_FILE):
+        return {"users": {}}
     try:
-        member = await bot.get_chat_member(chat_id=REQUIRED_CHANNEL, user_id=user_id)
-        if member.status in ["member", "administrator", "creator"]:
-            return True
-    except Exception:
-        pass
-    return False
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {"users": {}}
 
-@dp.message(CommandStart())
-async def command_start_handler(message: Message) -> None:
-    init_db()
-    add_user(message.from_user.id)
-    
-    if REQUIRED_CHANNEL and not await check_subscription(message.bot, message.from_user.id):
-        kb = InlineKeyboardBuilder()
-        kb.button(text="📢 Kanalga obuna bo'lish", url=f"https://t.me/{REQUIRED_CHANNEL.replace('@', '')}")
-        kb.button(text="✅ Obunani tekshirish", callback_data="check_sub")
-        await message.answer("Botdan foydalanish uchun avval quyidagi kanalimizga obuna bo'ling:", reply_markup=kb.as_markup())
-        return
 
-    await message.answer(
-        f"Salom, {html.bold(message.from_user.full_name)}! 🚀\n\n"
-        "🌐 **Qo'llab-quvvatlanadigan platformalar:**\n"
-        "• YouTube, Instagram, TikTok, Facebook, X (Twitter), Pinterest, SoundCloud!\n\n"
-        "📥 **Imkoniyatlar:**\n"
-        "1. Istalgan havolani yuboring (Videoni **suvsiz** yoki to'liq MP3 qilib oling).\n"
-        "2. Shunchaki **qo'shiq nomini yozing**, uni qidirib topib MP3 formatida beraman!"
-    )
+def save_data(data: dict) -> None:
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
-@dp.callback_query(F.data == "check_sub")
-async def verify_sub(callback: CallbackQuery):
-    if await check_subscription(callback.bot, callback.from_user.id):
-        await callback.message.edit_text("Rahmat! Endi botdan to'liq foydalanishingiz mumkin. Havola yoki qo'shiq nomini yuboring.")
+
+def get_user(user_id: int) -> dict:
+    data = load_data()
+    return data["users"].get(str(user_id), {"lang": "uz", "count": 0})
+
+
+def set_user_lang(user_id: int, lang: str) -> None:
+    data = load_data()
+    user = data["users"].setdefault(str(user_id), {"lang": "uz", "count": 0})
+    user["lang"] = lang
+    save_data(data)
+
+
+def increment_user_count(user_id: int, by: int = 1) -> None:
+    data = load_data()
+    user = data["users"].setdefault(str(user_id), {"lang": "uz", "count": 0})
+    user["count"] = user.get("count", 0) + by
+    save_data(data)
+
+
+# ------------------------------------------------------------------
+# TELEGRAM HANDLERLAR: START / TIL / STATISTIKA
+# ------------------------------------------------------------------
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    data = load_data()
+    if str(user_id) not in data["users"]:
+        await ask_language(update, context)
     else:
-        await callback.answer("Siz hali kanalga obuna bo'lmadingiz!", show_alert=True)
+        await update.message.reply_text(t(user_id, "welcome"))
 
-# Admin uchun statistika buyrug'i
-@dp.message(Command("stats"))
-async def stats_handler(message: Message) -> None:
-    count = get_stats()
-    await message.answer(f"📊 Botimizdagi jami foydalanuvchilar soni: **{count}** ta", parse_mode="Markdown")
 
-# Havolalar kelganda menyu chiqarish
-@dp.message(F.text.startswith("http"))
-async def media_menu(message: Message):
-    url = message.text.strip()
-    init_db()
-    add_user(message.from_user.id)
-    
-    if REQUIRED_CHANNEL and not await check_subscription(message.bot, message.from_user.id):
-        await message.answer("⚠️ Botdan foydalanish uchun kanalimizga obuna bo'lishingiz kerak!")
-        return
+async def ask_language(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("🇺🇿 O'zbekcha", callback_data="lang|uz"),
+                InlineKeyboardButton("🇷🇺 Русский", callback_data="lang|ru"),
+            ]
+        ]
+    )
+    await update.message.reply_text(
+        "Tilni tanlang / Выберите язык:", reply_markup=keyboard
+    )
 
-    builder = InlineKeyboardBuilder()
-    builder.button(text="🎬 Video (Suvsiz / HD)", callback_data=f"dl_vid_{url}")
-    builder.button(text="🎵 Musiqa (MP3)", callback_data=f"dl_mp3_{url}")
-    builder.adjust(1)
-    
-    await message.answer("Nimani yuklab beray?", reply_markup=builder.as_markup())
 
-# Yuklab olish jarayoni (yt-dlp orqali)
-@dp.callback_query(F.data.startswith("dl_"))
-async def process_media_download(callback: CallbackQuery):
-    data_parts = callback.data.split("_", 2)
-    dl_type = data_parts[1] 
-    url = data_parts[2]
-    
-    await callback.message.edit_text("📥 Fayl yuklab olinmoqda, iltimos kuting...")
-    
-    bot_info = await callback.bot.get_me()
-    bot_username = bot_info.username
-    
-    file_path = None
-    try:
-        if dl_type == "vid":
-            ydl_opts = {
-                'format': 'best',
-                'outtmpl': 'downloads/%(id)s.%(ext)s',
-                'max_filesize': 50 * 1024 * 1024,
-            }
-        else:
-            ydl_opts = {
-                'format': 'bestaudio/best',
-                'outtmpl': 'downloads/%(id)s.%(ext)s',
-                'postprocessors': [{
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': 'mp3',
-                    'preferredquality': '192',
-                }],
-                'max_filesize': 50 * 1024 * 1024,
-            }
-            
-        os.makedirs("downloads", exist_ok=True)
-        
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            filename = ydl.prepare_filename(info)
-            if dl_type == "mp3":
-                filename = os.path.splitext(filename)[0] + ".mp3"
-            file_path = filename
-            
-        if file_path and os.path.exists(file_path):
-            caption_text = f"@{bot_username} orqali yuklab olindi 🚀"
-            
-            if dl_type == "vid":
-                await callback.message.answer_video(FSInputFile(file_path), caption=caption_text)
-            else:
-                await callback.message.answer_audio(FSInputFile(file_path), caption=caption_text)
-            
-            increment_download(callback.from_user.id)
-            await callback.message.delete()
-            os.remove(file_path)
-        else:
-            await callback.message.edit_text("❌ Kechirasiz, faylni yuklab bo'lmadi yoki hajmi 50MB dan katta.")
-            
-    except Exception as e:
-        await callback.message.edit_text(f"❌ Xatolik yuz berdi: {str(e)}")
-        if file_path and os.path.exists(file_path):
-            os.remove(file_path)
+async def language_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await ask_language(update, context)
 
-# Qo'shiq nomi bo'yicha qidirib topish
-@dp.message(F.text & ~F.text.startswith("/") & ~F.text.startswith("http"))
-async def search_song(message: Message):
-    query = message.text.strip()
-    init_db()
-    add_user(message.from_user.id)
-    
-    if REQUIRED_CHANNEL and not await check_subscription(message.bot, message.from_user.id):
-        await message.answer("⚠️ Botdan foydalanish uchun kanalimizga obuna bo'lishingiz kerak!")
-        return
 
-    waiting_msg = await message.answer("🔍 Musiqa qidirilmoqda...")
-    
-    bot_info = await message.bot.get_me()
-    bot_username = bot_info.username
-    
-    file_path = None
-    try:
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    count = get_user(user_id).get("count", 0)
+    await update.message.reply_text(
+        t(user_id, "stats").format(count=count), parse_mode="Markdown"
+    )
+
+
+# ------------------------------------------------------------------
+# YORDAMCHI: progress-bar matni
+# ------------------------------------------------------------------
+
+def build_progress_bar(percent: float) -> str:
+    filled = int(percent / 10)
+    bar = "■" * filled + "□" * (10 - filled)
+    return f"[{bar}] {percent:.0f}%"
+
+
+# ------------------------------------------------------------------
+# YUKLAB OLISH FUNKSIYASI (alohida thread'da ishlaydi)
+# ------------------------------------------------------------------
+
+def extract_and_download(url: str, output_dir: str, quality: str, progress_callback):
+    """
+    yt-dlp bilan ma'lumotni yuklab oladi. Karusel (bir nechta rasm/video)
+    bo'lsa, hammasini yuklaydi. Yuklangan fayllar ro'yxatini qaytaradi:
+    [{"path": ..., "media_type": "video" | "photo" | "audio"}, ...]
+    """
+    output_template = os.path.join(output_dir, "%(id)s_%(autonumber)s.%(ext)s")
+
+    def hook(d):
+        if d.get("status") == "downloading":
+            percent_str = d.get("_percent_str", "0%").strip().replace("%", "")
+            try:
+                percent = float(percent_str)
+            except ValueError:
+                percent = 0.0
+            progress_callback(percent)
+
+    if quality == "mp3":
         ydl_opts = {
-            'format': 'bestaudio/best',
-            'outtmpl': 'downloads/%(id)s.%(ext)s',
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                'preferredquality': '192',
-            }],
-            'max_filesize': 50 * 1024 * 1024,
-            'default_search': 'ytsearch1',
-            'noplaylist': True,
+            "outtmpl": output_template,
+            "format": "bestaudio/best",
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": False,
+            "progress_hooks": [hook],
+            "postprocessors": [
+                {
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "192",
+                }
+            ],
         }
-        
-        os.makedirs("downloads", exist_ok=True)
-        
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(f"ytsearch1:{query}", download=True)
-            if 'entries' in info:
-                info = info['entries'][0]
-                
-            filename = ydl.prepare_filename(info)
-            filename = os.path.splitext(filename)[0] + ".mp3"
-            file_path = filename
-            title = info.get('title', 'Musiqa')
-            
-        if file_path and os.path.exists(file_path):
-            caption_text = f"🎶 **{title}**\n\n@{bot_username} orqali topib yuklandi 🚀"
-            await message.answer_audio(FSInputFile(file_path), caption=caption_text, parse_mode="Markdown")
-            increment_download(message.from_user.id)
-            await waiting_msg.delete()
-            os.remove(file_path)
-        else:
-            await waiting_msg.edit_text("❌ Kechirasiz, bu nomdagi musiqani topib bo'lmadi.")
-            
-    except Exception as e:
-        await waiting_msg.edit_text(f"❌ Xatolik yuz berdi: {str(e)}")
-        if file_path and os.path.exists(file_path):
-            os.remove(file_path)
+    else:
+        fmt = "worst[ext=mp4]/worst" if quality == "sd" else "best[ext=mp4]/best"
+        ydl_opts = {
+            "outtmpl": output_template,
+            "format": fmt,
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": False,  # karusel postlar uchun kerak
+            "progress_hooks": [hook],
+        }
 
-async def main() -> None:
-    if not TOKEN:
-        raise ValueError("BOT_TOKEN topilmadi!")
-    bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    print("Mukammal Media Bot bitta faylda ishga tushdi va buyruqlarni kutmoqda...")
-    await dp.start_polling(bot)
+    results = []
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+
+        entries = info.get("entries") if info.get("entries") is not None else [info]
+
+        for entry in entries:
+            if entry is None:
+                continue
+            raw_filename = ydl.prepare_filename(entry)
+
+            if quality == "mp3":
+                # Audio ajratib olingandan keyin fayl kengaytmasi .mp3 ga o'zgaradi
+                filename = os.path.splitext(raw_filename)[0] + ".mp3"
+                media_type = "audio"
+            else:
+                filename = raw_filename
+                ext = entry.get("ext", "")
+                media_type = "video" if ext in ("mp4", "mov", "mkv", "webm") else "photo"
+
+            if not os.path.exists(filename):
+                continue
+
+            results.append({"path": filename, "media_type": media_type})
+
+    return results
+
+
+# ------------------------------------------------------------------
+# XABAR HANDLER: LINK ANIQLASH VA SIFAT SO'RASH
+# ------------------------------------------------------------------
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text = update.message.text or ""
+    match = URL_PATTERN.search(text)
+
+    if not match:
+        await update.message.reply_text(t(user_id, "not_a_link"))
+        return
+
+    url = match.group(1)
+
+    # Uzun URL'ni callback_data ichiga to'g'ridan-to'g'ri joylashtirib bo'lmaydi
+    # (Telegram cheklovi 64 bayt), shuning uchun vaqtinchalik ID orqali saqlaymiz.
+    download_id = uuid.uuid4().hex[:8]
+    context.bot_data.setdefault("pending", {})[download_id] = url
+
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    t(user_id, "hd"), callback_data=f"dl|{download_id}|hd"
+                ),
+                InlineKeyboardButton(
+                    t(user_id, "sd"), callback_data=f"dl|{download_id}|sd"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    t(user_id, "mp3"), callback_data=f"dl|{download_id}|mp3"
+                ),
+            ],
+        ]
+    )
+    await update.message.reply_text(t(user_id, "choose_quality"), reply_markup=keyboard)
+
+
+# ------------------------------------------------------------------
+# CALLBACK HANDLER: TIL TANLASH VA SIFAT TANLASH
+# ------------------------------------------------------------------
+
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    data_parts = query.data.split("|")
+
+    if data_parts[0] == "lang":
+        lang = data_parts[1]
+        set_user_lang(user_id, lang)
+        await query.edit_message_text(TEXTS[lang]["lang_set"])
+        return
+
+    if data_parts[0] == "dl":
+        download_id, quality = data_parts[1], data_parts[2]
+        url = context.bot_data.get("pending", {}).pop(download_id, None)
+
+        if not url:
+            await query.edit_message_text(t(user_id, "error"))
+            return
+
+        await query.edit_message_text(t(user_id, "downloading") + " " + build_progress_bar(0))
+        await do_download(update, context, url, quality, query.message.chat_id, query.message.message_id)
+
+
+# ------------------------------------------------------------------
+# YUKLASH VA YUBORISH JARAYONI
+# ------------------------------------------------------------------
+
+async def do_download(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    url: str,
+    quality: str,
+    chat_id: int,
+    status_message_id: int,
+):
+    user_id = update.effective_user.id
+    loop = asyncio.get_event_loop()
+
+    last_percent = {"value": -100}
+
+    def progress_callback(percent: float):
+        if percent - last_percent["value"] >= 10:
+            last_percent["value"] = percent
+            text = t(user_id, "downloading") + " " + build_progress_bar(percent)
+            asyncio.run_coroutine_threadsafe(
+                context.bot.edit_message_text(
+                    chat_id=chat_id, message_id=status_message_id, text=text
+                ),
+                loop,
+            )
+
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            results = await loop.run_in_executor(
+                None, extract_and_download, url, tmpdir, quality, progress_callback
+            )
+
+            if not results:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id, message_id=status_message_id, text=t(user_id, "error")
+                )
+                return
+
+            valid_results = []
+            for r in results:
+                size_mb = os.path.getsize(r["path"]) / (1024 * 1024)
+                if size_mb <= MAX_FILE_SIZE_MB:
+                    valid_results.append(r)
+
+            if not valid_results:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id, message_id=status_message_id, text=t(user_id, "too_big")
+                )
+                return
+
+            await context.bot.edit_message_text(
+                chat_id=chat_id, message_id=status_message_id, text=t(user_id, "sending")
+            )
+
+            if len(valid_results) == 1:
+                r = valid_results[0]
+                with open(r["path"], "rb") as f:
+                    if r["media_type"] == "audio":
+                        await context.bot.send_audio(chat_id=chat_id, audio=f)
+                    elif r["media_type"] == "video":
+                        await context.bot.send_video(chat_id=chat_id, video=f)
+                    else:
+                        await context.bot.send_photo(chat_id=chat_id, photo=f)
+            else:
+                # Audio fayllar karusel bo'lmaydi, lekin ehtiyot uchun alohida yuboramiz
+                audio_results = [r for r in valid_results if r["media_type"] == "audio"]
+                media_results = [r for r in valid_results if r["media_type"] != "audio"]
+
+                for r in audio_results:
+                    with open(r["path"], "rb") as f:
+                        await context.bot.send_audio(chat_id=chat_id, audio=f)
+
+                for i in range(0, len(media_results), 10):
+                    chunk = media_results[i : i + 10]
+                    media = []
+                    open_files = []
+                    for r in chunk:
+                        f = open(r["path"], "rb")
+                        open_files.append(f)
+                        if r["media_type"] == "video":
+                            media.append(InputMediaVideo(f))
+                        else:
+                            media.append(InputMediaPhoto(f))
+                    await context.bot.send_media_group(chat_id=chat_id, media=media)
+                    for f in open_files:
+                        f.close()
+
+            increment_user_count(user_id, by=len(valid_results))
+
+            await context.bot.edit_message_text(
+                chat_id=chat_id, message_id=status_message_id, text=t(user_id, "done")
+            )
+
+    except yt_dlp.utils.DownloadError as e:
+        logger.error(f"Yuklab olishda xatolik: {e}")
+        await context.bot.edit_message_text(
+            chat_id=chat_id, message_id=status_message_id, text=t(user_id, "error")
+        )
+    except Exception as e:
+        logger.error(f"Kutilmagan xatolik: {e}")
+        await context.bot.edit_message_text(
+            chat_id=chat_id, message_id=status_message_id, text=t(user_id, "unexpected_error")
+        )
+
+
+# ------------------------------------------------------------------
+# BOTNI ISHGA TUSHIRISH
+# ------------------------------------------------------------------
+
+def main():
+    if BOT_TOKEN == "SIZNING_TOKENINGIZ_BU_YERGA":
+        print(
+            "❗ BOT_TOKEN o'rnatilmagan. Muhit o'zgaruvchisi sifatida sozlang:\n"
+            "   export BOT_TOKEN='sizning_tokeningiz'\n"
+            "   python bot.py"
+        )
+        return
+
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("language", language_command))
+    app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CallbackQueryHandler(callback_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    logger.info("Bot ishga tushdi...")
+    app.run_polling()
+
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, stream=sys.stdout)
-    asyncio.run(main())
+    main()
